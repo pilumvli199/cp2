@@ -4,13 +4,13 @@ Crypto Phase-1 Bot — single-file implementation (main.py)
 Features:
 - Polls Binance every 5 minutes for symbols:
   BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, AAVEUSDT, TRXUSDT
-- Stores last price + timestamp into Redis (redis.asyncio)
+- Stores last price + timestamp into Redis (redis.asyncio, TLS enabled)
 - Sends a Telegram message on start/restart: "Bot online"
 - Every 5 minutes sends a Telegram message with the last prices
 - Sends compact price data to OpenAI for a short analysis included in Telegram message
 
 Environment variables required:
-- REDIS_URL  (e.g. rediss://default:password@host:6379)
+- REDIS_URL  (Railway Redis plugin → rediss://...)
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
 - OPENAI_API_KEY
@@ -142,7 +142,7 @@ async def openai_analyze(price_map: dict):
 
 
 async def periodic_task():
-    # Connect to Redis (Railway needs ssl=True)
+    # Connect to Redis (Railway uses TLS → ssl=True)
     r = None
     try:
         r = redis.from_url(REDIS_URL, decode_responses=True, ssl=True)
