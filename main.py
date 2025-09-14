@@ -10,21 +10,10 @@ Features:
 - Sends compact price data to OpenAI for a short analysis included in Telegram message
 
 Environment variables required:
-- REDIS_URL  (e.g. redis://default:password@host:6379/0)
+- REDIS_URL  (e.g. rediss://default:password@host:6379)
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
 - OPENAI_API_KEY
-
-Dependencies:
-- aiohttp
-- redis (redis.asyncio)
-- openai
-- python-dotenv
-
-Run:
-- pip install -r requirements.txt
-- export env vars (or use .env)
-- python main.py
 """
 
 import os
@@ -35,7 +24,7 @@ from datetime import datetime, timezone
 
 import aiohttp
 import redis.asyncio as redis
-import openai
+from openai import OpenAI
 from dotenv import load_dotenv
 
 # Load .env if present
@@ -46,6 +35,9 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# Init OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Symbols (Binance)
 SYMBOLS = [
@@ -62,9 +54,6 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 300))
 
 BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
-
-# Configure OpenAI library key
-openai.api_key = OPENAI_API_KEY
 
 
 async def send_telegram(session: aiohttp.ClientSession, text: str):
@@ -114,35 +103,22 @@ async def save_to_redis(r, symbol: str, price: float):
     await r.set(key, json.dumps(payload))
 
 
-async def read_all_from_redis(r):
-    results = {}
-    for s in SYMBOLS:
-        key = f"price:{s}"
-        raw = await r.get(key)
-        if raw:
-            try:
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = raw.decode()
-                results[s] = json.loads(raw)
-            except Exception:
-                results[s] = None
-        else:
-            results[s] = None
-    return results
+async def read_from_redis(r, symbol: str):
+    raw = await r.get(f"price:{symbol}")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
 
 
 async def openai_analyze(price_map: dict):
-    """Sends a compact prompt to OpenAI and returns a short single-line summary."""
     if not OPENAI_API_KEY:
         print("[WARN] OPENAI_API_KEY not set; skipping analysis.")
         return None
 
-    lines = []
-    for s, v in price_map.items():
-        if v:
-            lines.append(f"{s}: {v['price']}")
-        else:
-            lines.append(f"{s}: NA")
+    lines = [f"{s}: {v['price']}" if v else f"{s}: NA" for s, v in price_map.items()]
     prompt = (
         "You are a concise crypto market assistant. Given the following latest spot prices (UTC), "
         "provide a one-sentence summary indicating any notable observations (e.g., big moves, relative strength, warnings).\n\n"
@@ -150,30 +126,28 @@ async def openai_analyze(price_map: dict):
     )
 
     try:
-        model = "gpt-3.5-turbo"
         resp = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: openai.ChatCompletion.create(
-                model=model,
+            lambda: client.chat.completions.create(
+                model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=60,
                 temperature=0.3,
             ),
         )
-        text = resp["choices"][0]["message"]["content"].strip()
-        return text.splitlines()[0]
+        return resp.choices[0].message.content.strip().splitlines()[0]
     except Exception as e:
         print(f"[ERROR] OpenAI request failed: {e}")
         return None
 
 
 async def periodic_task():
-    # Connect to Redis using redis.asyncio
+    # Connect to Redis (Railway needs ssl=True)
     r = None
     try:
-        r = redis.from_url(REDIS_url := REDIS_URL, decode_responses=False)
+        r = redis.from_url(REDIS_URL, decode_responses=True, ssl=True)
         await r.ping()
-        print(f"[INFO] Connected to Redis at {REDIS_url}")
+        print(f"[INFO] Connected to Redis at {REDIS_URL}")
     except Exception as e:
         print(f"[ERROR] Cannot connect to Redis at {REDIS_URL}: {e}")
         r = None
@@ -201,16 +175,7 @@ async def periodic_task():
                     price_map[s] = {"price": p}
                 else:
                     if r:
-                        raw = await r.get(f"price:{s}")
-                        if raw:
-                            try:
-                                if isinstance(raw, (bytes, bytearray)):
-                                    raw = raw.decode()
-                                price_map[s] = json.loads(raw)
-                            except Exception:
-                                price_map[s] = None
-                        else:
-                            price_map[s] = None
+                        price_map[s] = await read_from_redis(r, s)
                     else:
                         price_map[s] = None
 
@@ -234,24 +199,18 @@ async def periodic_task():
             await send_telegram(session, message)
             print(f"[INFO] Sent prices update at {datetime.utcnow().isoformat()} UTC")
 
-            # Sleep until next interval (respect time taken to fetch)
+            # Sleep until next interval
             elapsed = time.time() - start
             to_sleep = max(0, POLL_INTERVAL - elapsed)
             await asyncio.sleep(to_sleep)
 
 
 def main():
-    # Basic checks
-    missing = []
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
-    if not OPENAI_API_KEY:
-        print("[WARN] OPENAI_API_KEY not set; OpenAI analysis will be skipped.")
-
-    if missing:
-        print("[ERROR] Missing required environment variables:", ", ".join(missing))
-        print("Set them and re-run. Exiting.")
+        print("[ERROR] Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
         return
+    if not OPENAI_API_KEY:
+        print("[WARN] OPENAI_API_KEY not set; analysis skipped")
 
     print("[INFO] Starting crypto Phase-1 bot...")
     try:
